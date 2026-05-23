@@ -34,25 +34,55 @@ int ds_seccomp_apply_minimal(int hw_access, int privileged_mask) {
   static struct sock_filter filter[84];
   int curr = 0;
 
-  /* 1. Validate Architecture */
+  /* 1. Validate Architecture
+   *
+   * If noseccomp (DS_PRIV_NOSEC) is requested, we allow BOTH the native
+   * architecture and its 32-bit compatibility equivalent (e.g. x86_64 + i386).
+   * This is critical for Android rootfs which rely on 32-bit zygotes/tests.
+   */
   filter[curr++] = (struct sock_filter)BPF_STMT(
       BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
-#if defined(__aarch64__)
-  filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                AUDIT_ARCH_AARCH64, 1, 0);
-#elif defined(__x86_64__)
-  filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                AUDIT_ARCH_X86_64, 1, 0);
-#elif defined(__arm__)
-  filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                AUDIT_ARCH_ARM, 1, 0);
-#elif defined(__i386__)
-  filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                AUDIT_ARCH_I386, 1, 0);
-#elif defined(__riscv) && __riscv_xlen == 64
-  filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
-                                                AUDIT_ARCH_RISCV64, 1, 0);
+
+  if (privileged_mask & DS_PRIV_NOSEC) {
+#if defined(__x86_64__) || defined(__i386__)
+    /* Allow both x86_64 and i386 */
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_X86_64, 2, 0);
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_I386, 1, 0);
+#elif defined(__aarch64__) || defined(__arm__)
+    /* Allow both aarch64 and arm */
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_AARCH64, 2, 0);
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_ARM, 1, 0);
+#else
+    /* Fallback for other architectures (RISCV, etc.) */
+#if defined(__riscv) && __riscv_xlen == 64
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_RISCV64, 1, 0);
 #endif
+#endif
+  } else {
+    /* Strict mode: only allow the native architecture */
+#if defined(__aarch64__)
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_AARCH64, 1, 0);
+#elif defined(__x86_64__)
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_X86_64, 1, 0);
+#elif defined(__arm__)
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_ARM, 1, 0);
+#elif defined(__i386__)
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_I386, 1, 0);
+#elif defined(__riscv) && __riscv_xlen == 64
+    filter[curr++] = (struct sock_filter)BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K,
+                                                  AUDIT_ARCH_RISCV64, 1, 0);
+#endif
+  }
+
   filter[curr++] =
       (struct sock_filter)BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS);
 
@@ -276,23 +306,33 @@ int android_seccomp_setup(int is_systemd, int block_nested_ns) {
   }
 
   /* Define base filter (arch check + load nr) */
-  struct sock_filter filter_base[] = {
-      /* Same wrong-arch fix as ds_seccomp_apply_minimal: KILL on mismatch. */
-      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch)),
-#if defined(__aarch64__)
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 1, 0),
-#elif defined(__x86_64__)
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 1, 0),
-#elif defined(__arm__)
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_ARM, 1, 0),
-#elif defined(__i386__)
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_I386, 1, 0),
-#elif defined(__riscv) && __riscv_xlen == 64
-      BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_RISCV64, 1, 0),
+  struct sock_filter filter_base[16];
+  int b_curr = 0;
+
+  filter_base[b_curr++] = (struct sock_filter)BPF_STMT(
+      BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, arch));
+
+#if defined(__x86_64__) || defined(__i386__)
+  filter_base[b_curr++] = (struct sock_filter)BPF_JUMP(
+      BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64, 2, 0);
+  filter_base[b_curr++] = (struct sock_filter)BPF_JUMP(
+      BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_I386, 1, 0);
+#elif defined(__aarch64__) || defined(__arm__)
+  filter_base[b_curr++] = (struct sock_filter)BPF_JUMP(
+      BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 2, 0);
+  filter_base[b_curr++] = (struct sock_filter)BPF_JUMP(
+      BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_ARM, 1, 0);
+#else
+#if defined(__riscv) && __riscv_xlen == 64
+  filter_base[b_curr++] = (struct sock_filter)BPF_JUMP(
+      BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_RISCV64, 1, 0);
 #endif
-      BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS), /* wrong arch */
-      BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr)),
-  };
+#endif
+
+  filter_base[b_curr++] = (struct sock_filter)BPF_STMT(
+      BPF_RET | BPF_K, SECCOMP_RET_KILL_PROCESS); /* wrong arch */
+  filter_base[b_curr++] = (struct sock_filter)BPF_STMT(
+      BPF_LD | BPF_W | BPF_ABS, offsetof(struct seccomp_data, nr));
 
   struct sock_filter filter_keyring[] = {
       BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_keyctl, 0, 1),
@@ -312,7 +352,7 @@ int android_seccomp_setup(int is_systemd, int block_nested_ns) {
       BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
 
   /* Combine filters based on conditions */
-  int filter_len = sizeof(filter_base) / sizeof(struct sock_filter);
+  int filter_len = b_curr;
   if (major < 5)
     filter_len += sizeof(filter_keyring) / sizeof(struct sock_filter);
   if (block_nested_ns)
@@ -325,8 +365,8 @@ int android_seccomp_setup(int is_systemd, int block_nested_ns) {
     return -1;
 
   int curr = 0;
-  memcpy(final_filter + curr, filter_base, sizeof(filter_base));
-  curr += sizeof(filter_base) / sizeof(struct sock_filter);
+  memcpy(final_filter + curr, filter_base, b_curr * sizeof(struct sock_filter));
+  curr += b_curr;
 
   if (major < 5) {
     memcpy(final_filter + curr, filter_keyring, sizeof(filter_keyring));
